@@ -4,7 +4,7 @@
 
 **כלי לייצור לוח תורנויות אופטימלי למפקדים במילואים**
 
-[נסו עכשיו](https://optishift.vercel.app) · [דווחו על באג](../../issues)
+[נסו עכשיו](https://optishift.vercel.app) )
 
 </div>
 
