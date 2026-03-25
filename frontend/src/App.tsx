@@ -1,5 +1,6 @@
-import React, { useMemo, useState, useRef } from 'react';
+import React, { useMemo, useState, useRef, useEffect, useCallback } from 'react';
 import html2canvas from 'html2canvas';
+import * as XLSX from 'xlsx';
 import { buildSchedule, type Soldier, type ScheduleConfig, type ScheduleEntry, type SoldierStats, type ScheduleResult, type FixedEntry, type DayStatus } from './solver';
 
 const dayNames = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת'];
@@ -25,11 +26,33 @@ function getCellDisplay(entry: ScheduleEntry | undefined) {
 
 interface ManualOverride { soldierId: string; date: string; status: 'base' | 'home'; }
 
+// ── localStorage helpers ──
+const STORAGE_KEY = 'optishift_state';
+
+interface SavedState {
+  soldiers: Soldier[];
+  config: ScheduleConfig;
+  overrides: ManualOverride[];
+}
+
+function loadState(): SavedState | null {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch { return null; }
+}
+
+function saveState(state: SavedState) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch { /* ignore */ }
+}
+
 const App: React.FC = () => {
+  const saved = useRef(loadState());
   const today = new Date();
   const twoWeeks = new Date(today.getTime() + 13 * 86400000);
 
-  const [config, setConfig] = useState<ScheduleConfig>({
+  const [config, setConfig] = useState<ScheduleConfig>(saved.current?.config ?? {
     startDate: today.toISOString().slice(0, 10),
     endDate: twoWeeks.toISOString().slice(0, 10),
     minSoldiersOnBase: 2,
@@ -37,17 +60,22 @@ const App: React.FC = () => {
     minConsecutiveBaseDays: 2,
   });
 
-  const [soldiers, setSoldiers] = useState<Soldier[]>([]);
+  const [soldiers, setSoldiers] = useState<Soldier[]>(saved.current?.soldiers ?? []);
   const [newName, setNewName] = useState('');
   const [result, setResult] = useState<ScheduleResult | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [overrides, setOverrides] = useState<ManualOverride[]>([]);
+  const [overrides, setOverrides] = useState<ManualOverride[]>(saved.current?.overrides ?? []);
   const [ovSoldier, setOvSoldier] = useState('');
   const [ovDate, setOvDate] = useState('');
   const [ovStatus, setOvStatus] = useState<'base' | 'home'>('base');
   const [blockedInput, setBlockedInput] = useState<{ id: string; date: string }>({ id: '', date: '' });
   const [expandedSoldier, setExpandedSoldier] = useState<string | null>(null);
+  const [importMsg, setImportMsg] = useState<string | null>(null);
   const tableRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Auto-save to localStorage
+  useEffect(() => { saveState({ soldiers, config, overrides }); }, [soldiers, config, overrides]);
 
   const dates = useMemo(() => {
     const out: string[] = [];
@@ -139,10 +167,135 @@ const App: React.FC = () => {
     } catch { setError('שגיאה בייצוא.'); }
   }
 
+  // ── Excel Export ──
+  const exportExcel = useCallback(() => {
+    if (!result) return;
+
+    // Sheet 1: Schedule table
+    const header = ['תאריך', 'יום', ...soldiers.map(s => s.name), 'בבסיס'];
+    const rows = dates.map(dt => {
+      const d = new Date(dt + 'T00:00:00');
+      const dayName = dayNames[d.getDay()];
+      const cells = soldiers.map(s => {
+        const e = entriesByKey.get(`${dt}|${s.id}`);
+        return getCellDisplay(e).label;
+      });
+      const cnt = baseCountByDate.get(dt) ?? 0;
+      return [dt, dayName, ...cells, cnt];
+    });
+    const scheduleData = [header, ...rows];
+
+    // Sheet 2: Stats
+    const statsHeader = ['שם', 'ימי שירות', 'ימי בית', 'אילוצים'];
+    const statsRows = soldiers.map(s => {
+      const st = statsBySoldierId.get(s.id);
+      return [s.name, st?.totalBaseDays ?? 0, st?.totalHomeDays ?? 0, st?.totalBlockedDays ?? 0];
+    });
+    const statsData = [statsHeader, ...statsRows];
+
+    // Sheet 3: Soldiers & constraints (for re-import)
+    const soldiersHeader = ['שם', 'תאריכי אילוץ (מופרדים בפסיק)'];
+    const soldiersRows = soldiers.map(s => [s.name, s.blockedDates.join(', ')]);
+    const soldiersData = [soldiersHeader, ...soldiersRows];
+
+    const wb = XLSX.utils.book_new();
+    const ws1 = XLSX.utils.aoa_to_sheet(scheduleData);
+    const ws2 = XLSX.utils.aoa_to_sheet(statsData);
+    const ws3 = XLSX.utils.aoa_to_sheet(soldiersData);
+
+    // Set RTL and column widths
+    ws1['!cols'] = [{ wch: 12 }, { wch: 8 }, ...soldiers.map(() => ({ wch: 14 })), { wch: 8 }];
+    ws2['!cols'] = [{ wch: 15 }, { wch: 12 }, { wch: 10 }, { wch: 10 }];
+    ws3['!cols'] = [{ wch: 15 }, { wch: 50 }];
+
+    XLSX.utils.book_append_sheet(wb, ws1, 'לוח שיבוצים');
+    XLSX.utils.book_append_sheet(wb, ws2, 'סטטיסטיקה');
+    XLSX.utils.book_append_sheet(wb, ws3, 'חיילים ואילוצים');
+
+    XLSX.writeFile(wb, `optishift-${config.startDate}_${config.endDate}.xlsx`);
+  }, [result, soldiers, dates, entriesByKey, baseCountByDate, statsBySoldierId, config]);
+
+  // ── Excel Import ──
+  function handleImportExcel(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const data = new Uint8Array(ev.target?.result as ArrayBuffer);
+        const wb = XLSX.read(data, { type: 'array' });
+
+        // Look for soldiers sheet first, then fall back to first sheet
+        const sheetName = wb.SheetNames.find(n => n.includes('חיילים')) ?? wb.SheetNames[0];
+        const ws = wb.Sheets[sheetName];
+        const rows: (string | number | undefined)[][] = XLSX.utils.sheet_to_json(ws, { header: 1 });
+
+        if (rows.length < 2) { setImportMsg('הקובץ ריק או לא בפורמט הנכון.'); return; }
+
+        const imported: Soldier[] = [];
+        // Skip header row
+        for (let r = 1; r < rows.length; r++) {
+          const name = String(rows[r][0] ?? '').trim();
+          if (!name) continue;
+
+          const blockedRaw = String(rows[r][1] ?? '').trim();
+          const blockedDates: string[] = [];
+          if (blockedRaw) {
+            for (const part of blockedRaw.split(/[,;،]/)) {
+              const dt = part.trim();
+              if (/^\d{4}-\d{2}-\d{2}$/.test(dt)) {
+                blockedDates.push(dt);
+              }
+            }
+          }
+
+          imported.push({
+            id: `${Date.now()}-${Math.random().toString(16).slice(2)}-${r}`,
+            name,
+            blockedDates: blockedDates.sort(),
+          });
+        }
+
+        if (imported.length === 0) { setImportMsg('לא נמצאו חיילים בקובץ.'); return; }
+
+        setSoldiers(imported);
+        setResult(null);
+        setImportMsg(`יובאו ${imported.length} חיילים בהצלחה!`);
+        setTimeout(() => setImportMsg(null), 4000);
+      } catch {
+        setImportMsg('שגיאה בקריאת הקובץ.');
+      }
+    };
+    reader.readAsArrayBuffer(file);
+    // Reset input so same file can be imported again
+    e.target.value = '';
+  }
+
+  // ── Download template Excel ──
+  function downloadTemplate() {
+    const header = ['שם', 'תאריכי אילוץ (מופרדים בפסיק)'];
+    const example = ['ישראל ישראלי', '2026-04-05, 2026-04-12'];
+    const ws = XLSX.utils.aoa_to_sheet([header, example]);
+    ws['!cols'] = [{ wch: 20 }, { wch: 50 }];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'חיילים ואילוצים');
+    XLSX.writeFile(wb, 'optishift-template.xlsx');
+  }
+
+  function clearAll() {
+    setSoldiers([]);
+    setOverrides([]);
+    setResult(null);
+    setError(null);
+    localStorage.removeItem(STORAGE_KEY);
+  }
+
   // ── Styles ──
   const inp: React.CSSProperties = { width: '100%', marginTop: 4, background: '#252832', border: '1px solid #2d3140', color: 'inherit', padding: '6px 8px', borderRadius: 4, fontSize: 13, boxSizing: 'border-box' };
   const btn: React.CSSProperties = { background: '#10b981', color: '#000', border: 'none', padding: '6px 14px', cursor: 'pointer', borderRadius: 4, fontWeight: 600, fontSize: 13 };
   const btnGhost: React.CSSProperties = { ...btn, background: '#374151', color: '#e2e8f0' };
+  const btnSmall: React.CSSProperties = { ...btnGhost, padding: '4px 10px', fontSize: 11 };
 
   return (
     <div style={{ minHeight: '100vh', background: '#0f1117', color: '#f1f5f9', display: 'flex', flexDirection: 'column', fontFamily: 'system-ui, -apple-system, sans-serif' }}>
@@ -176,11 +329,34 @@ const App: React.FC = () => {
               <span style={{ background: '#10b981', color: '#000', borderRadius: 99, width: 20, height: 20, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, fontWeight: 800 }}>2</span>
               חיילים ואילוצים
             </h2>
+
+            {/* Import/Export buttons */}
+            <div style={{ display: 'flex', gap: 4, marginBottom: 8, flexWrap: 'wrap' }}>
+              <button onClick={() => fileInputRef.current?.click()} style={btnSmall}>
+                ייבוא מאקסל
+              </button>
+              <button onClick={downloadTemplate} style={btnSmall}>
+                הורד תבנית
+              </button>
+              {soldiers.length > 0 && (
+                <button onClick={clearAll} style={{ ...btnSmall, color: '#f87171', background: '#374151' }}>
+                  נקה הכל
+                </button>
+              )}
+              <input ref={fileInputRef} type="file" accept=".xlsx,.xls,.csv" onChange={handleImportExcel} style={{ display: 'none' }} />
+            </div>
+
+            {importMsg && (
+              <div style={{ fontSize: 12, color: importMsg.includes('שגיאה') || importMsg.includes('לא נמצאו') ? '#ef4444' : '#10b981', background: importMsg.includes('שגיאה') ? '#ef444415' : '#10b98115', padding: '6px 10px', borderRadius: 6, marginBottom: 6 }}>
+                {importMsg}
+              </div>
+            )}
+
             <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
               <input placeholder="שם חייל" value={newName} onChange={e => setNewName(e.target.value)} onKeyDown={e => e.key === 'Enter' && addSoldier()} style={{ ...inp, flex: 1, marginTop: 0 }} />
               <button onClick={addSoldier} style={btn}>הוסף</button>
             </div>
-            <div style={{ maxHeight: 'calc(100vh - 500px)', minHeight: 120, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <div style={{ maxHeight: 'calc(100vh - 560px)', minHeight: 120, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 6 }}>
               {soldiers.map(s => {
                 const isOpen = expandedSoldier === s.id;
                 return (
@@ -275,9 +451,9 @@ const App: React.FC = () => {
         <main style={{ flex: 1, padding: 20, overflow: 'auto' }}>
           {result ? (
             <>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, flexWrap: 'wrap', gap: 8 }}>
                 <h2 style={{ fontSize: 18, fontWeight: 700 }}>לוח שיבוצים</h2>
-                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
                   {/* Legend */}
                   <div style={{ display: 'flex', gap: 10, fontSize: 11, color: '#94a3b8' }}>
                     {(['arriving', 'base', 'departing', 'blocked', 'home'] as DayStatus[]).map(s => (
@@ -287,6 +463,7 @@ const App: React.FC = () => {
                       </span>
                     ))}
                   </div>
+                  <button onClick={exportExcel} style={{ ...btn, background: '#2563eb' }}>ייצוא לאקסל</button>
                   <button onClick={exportImage} style={btn}>שמור כתמונה</button>
                 </div>
               </div>
