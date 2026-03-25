@@ -1,10 +1,10 @@
-# OptiShift — ניהול תורנויות חכם למילואים
+# OptShift — ניהול תורנויות חכם למילואים
 
 <div align="center">
 
 **כלי לייצור לוח תורנויות אופטימלי למפקדים במילואים**
 
-[נסו עכשיו](https://optishift.vercel.app) 
+[נסו עכשיו](https://optshift.vercel.app) 
 
 </div>
 
